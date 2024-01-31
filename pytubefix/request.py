@@ -8,81 +8,37 @@ from functools import lru_cache
 from urllib import parse
 from urllib.error import URLError
 from urllib.request import Request, urlopen
-
+from copy import deepcopy
+import requests
 from pytubefix.exceptions import RegexMatchError, MaxRetriesExceeded
 from pytubefix.helpers import regex_search
 
 logger = logging.getLogger(__name__)
 default_range_size = 9437184  # 9MB
 
-
-def _execute_request(
-    url,
-    method=None,
-    headers=None,
-    data=None,
-    timeout=socket._GLOBAL_DEFAULT_TIMEOUT
-):
-    base_headers = {"User-Agent": "Mozilla/5.0", "accept-language": "en-US,en"}
-    if headers:
-        base_headers.update(headers)
-    if data:
-        # encode data for request
-        if not isinstance(data, bytes):
-            data = bytes(json.dumps(data), encoding="utf-8")
-    if url.lower().startswith("http"):
-        request = Request(url, headers=base_headers, method=method, data=data)
-    else:
-        raise ValueError("Invalid URL")
-    return urlopen(request, timeout=timeout)  # nosec
+base_headers = {"accept-language": "en-US,en"}
 
 
-def get(url, extra_headers=None, timeout=socket._GLOBAL_DEFAULT_TIMEOUT):
-    """Send an http GET request.
-
-    :param str url:
-        The URL to perform the GET request for.
-    :param dict extra_headers:
-        Extra headers to add to the request
-    :rtype: str
-    :returns:
-        UTF-8 encoded string of response
-    """
+def get(url, extra_headers=None, timeout=30):
     if extra_headers is None:
         extra_headers = {}
-    response = _execute_request(url, headers=extra_headers, timeout=timeout)
-    return response.read().decode("utf-8")
+    headers = deepcopy(base_headers)
+    headers.update(extra_headers)
+    rq = requests.get(url, headers=headers, timeout=timeout)
+    if rq:
+        return rq.content.decode('utf-8')
 
 
-def post(url, extra_headers=None, data=None, timeout=socket._GLOBAL_DEFAULT_TIMEOUT):
-    """Send an http POST request.
-
-    :param str url:
-        The URL to perform the POST request for.
-    :param dict extra_headers:
-        Extra headers to add to the request
-    :param dict data:
-        The data to send on the POST request
-    :rtype: str
-    :returns:
-        UTF-8 encoded string of response
-    """
-    # could technically be implemented in get,
-    # but to avoid confusion implemented like this
+def post(url, extra_headers=None, data=None, timeout=30):
     if extra_headers is None:
         extra_headers = {}
     if data is None:
         data = {}
-    # required because the youtube servers are strict on content type
-    # raises HTTPError [400]: Bad Request otherwise
-    extra_headers.update({"Content-Type": "application/json"})
-    response = _execute_request(
-        url,
-        headers=extra_headers,
-        data=data,
-        timeout=timeout
-    )
-    return response.read().decode("utf-8")
+    headers = deepcopy(base_headers)
+    headers.update(extra_headers)
+    rq = requests.post(url, headers=headers, json=data, timeout=timeout)
+    if rq:
+        return rq.content.decode('utf-8')
 
 
 def seq_stream(
@@ -134,68 +90,9 @@ def seq_stream(
 def stream(url,
            timeout=socket._GLOBAL_DEFAULT_TIMEOUT,
            max_retries=0):
-    """Read the response in chunks.
-    :param str url: The URL to perform the GET request for.
-    :rtype: Iterable[bytes]
-    """
-    file_size: int = default_range_size  # fake filesize to start
-    downloaded = 0
-    while downloaded < file_size:
-        stop_pos = min(downloaded + default_range_size, file_size) - 1
-        range_header = f"bytes={downloaded}-{stop_pos}"
-        tries = 0
-
-        # Attempt to make the request multiple times as necessary.
-        while True:
-            # If the max retries is exceeded, raise an exception
-            if tries >= 1 + max_retries:
-                raise MaxRetriesExceeded()
-
-            # Try to execute the request, ignoring socket timeouts
-            try:
-                response = _execute_request(
-                    url + f"&range={downloaded}-{stop_pos}",
-                    method="GET",
-                    timeout=timeout
-                )
-            except URLError as e:
-                # We only want to skip over timeout errors, and
-                # raise any other URLError exceptions
-                if isinstance(e.reason, socket.timeout):
-                    pass
-                else:
-                    raise
-            except http.client.IncompleteRead:
-                # Allow retries on IncompleteRead errors for unreliable connections
-                pass
-            else:
-                # On a successful request, break from loop
-                break
-            tries += 1
-
-        if file_size == default_range_size:
-            try:
-                resp = _execute_request(
-                    url + f"&range={0}-{99999999999}",
-                    method="GET",
-                    timeout=timeout
-                )
-                content_range = resp.info()["Content-Length"]
-                file_size = int(content_range)
-            except (KeyError, IndexError, ValueError) as e:
-                logger.error(e)
-        while True:
-            try:
-                chunk = response.read()
-            except StopIteration:
-                return
-
-            if not chunk:
-                break
-
-            if chunk: downloaded += len(chunk)
-            yield chunk
-    return  # pylint: disable=R1711
+    r = requests.get(url, headers=base_headers, stream=True)
+    for line in r.iter_content(chunk_size=1024):
+        yield line
 
 
 @lru_cache()
@@ -225,8 +122,8 @@ def seq_filesize(url):
     #  information about how the file is segmented.
     querys['sq'] = 0
     url = base_url + parse.urlencode(querys)
-    response = _execute_request(
-        url, method="GET"
+    response = requests.get(
+        url, headers=base_headers,
     )
 
     response_value = response.read()
@@ -269,5 +166,5 @@ def head(url):
     :returns:
         dictionary of lowercase headers
     """
-    response_headers = _execute_request(url, method="HEAD").info()
-    return {k.lower(): v for k, v in response_headers.items()}
+    response = requests.head(url)
+    return {k.lower(): v for k, v in response.headers.items()}
